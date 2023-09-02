@@ -3,13 +3,19 @@
 from mpi4py import MPI
 import numpy as np
 from torch.utils.data import DataLoader, Dataset
-from transformers import AutoModelForCausalLM, AutoConfig, AutoTokenizer, default_data_collator, PreTrainedTokenizerFast, \
+
+from transformers import (
+    AutoModelForCausalLM, 
+    AutoConfig, 
+    AutoTokenizer, 
+    default_data_collator, 
+    PreTrainedTokenizerFast, 
     PreTrainedTokenizer
+)
 from datasets import load_dataset
 import sys, os
 import torch
-# sys.path.insert(0, os.path.join(sys.path[0], '../../transformers/examples/pytorch/language-modeling'))
-# from custom_trainer import GPT2LMHeadModelCompress, BERTModelCompress, AutoEncoderWithNoise
+
 from collections import Counter, defaultdict
 from functools import partial
 from itertools import chain

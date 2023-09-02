@@ -1,11 +1,11 @@
 import argparse
 import inspect
 
-from . import gaussian_diffusion as gd
-from .respace import SpacedDiffusion, space_timesteps
-from .unet import SuperResModel, UNetModel
-from .transformer_model import TransUNetModel
-from .transformer_model2 import TransformerNetModel, TransformerNetModel2
+from src.models.diffusion.models import gaussian_diffusion as gd
+from src.models.diffusion.modules.respace import SpacedDiffusion, space_timesteps
+from src.models.diffusion.modules.unet import SuperResModel, UNetModel
+from src.models.diffusion.modules.transformer_model import TransUNetModel
+from src.models.diffusion.modules.transformer_model2 import TransformerNetModel, TransformerNetModel2
 NUM_CLASSES = 1000
 
 
