@@ -1,0 +1,12 @@
+datasets/
+__pycache__/
+*.log
+.idea/
+.vscode/
+transformers/
+mpi4py/
+improved-diffusion/diffusion_models/
+*.ckpt
+*.egg-info
+wandb/
+own_experiments/
