@@ -1,8 +1,10 @@
+from turtle import forward
 from .transformer_utils import BertAttention, trans_nd, layer_norm
 from transformers import AutoConfig
 # from transformers import BertEncoder
 from transformers.models.bert.modeling_bert import BertEncoder
 import torch
+from transformers import BertModel, BertConfig
 from abc import abstractmethod
 
 import math
@@ -12,8 +14,10 @@ import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .fp16_util import convert_module_to_f16, convert_module_to_f32
-from .nn import (
+from transformers.activations import ACT2FN
+
+from src.utils.fp16_util import convert_module_to_f16, convert_module_to_f32
+from src.models.diffusion.modules.nn import (
     SiLU,
     conv_nd,
     linear,
@@ -22,7 +26,29 @@ from .nn import (
     timestep_embedding,
     checkpoint,
 )
+from src.models.diffusion.modules.attention import BasicTransformerBlock
 
+
+class GELUActivation(nn.Module):
+    """
+    Original Implementation of the GELU activation function in Google BERT repo when initially created. For
+    information: OpenAI GPT's GELU is slightly different (and gives slightly different results): 0.5 * x * (1 +
+    torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * torch.pow(x, 3)))) This is now written in C in nn.functional
+    Also see the Gaussian Error Linear Units paper: https://arxiv.org/abs/1606.08415
+    """
+
+    def __init__(self, use_gelu_python: bool = False):
+        super().__init__()
+        if use_gelu_python:
+            self.act = self._gelu_python
+        else:
+            self.act = nn.functional.gelu
+
+    def _gelu_python(self, input: Tensor) -> Tensor:
+        return input * 0.5 * (1.0 + torch.erf(input / math.sqrt(2.0)))
+
+    def forward(self, input: Tensor) -> Tensor:
+        return self.act(input)
 
 class TimestepBlock(nn.Module):
     """
@@ -42,10 +68,12 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
     support it as an extra input.
     """
 
-    def forward(self, x, emb):
+    def forward(self, x, emb, context=None):
         for layer in self:
             if isinstance(layer, TimestepBlock):
                 x = layer(x, emb)
+            elif isinstance(layer, BasicTransformerBlock):
+                x = layer(x, context)
             else:
                 x = layer(x)
         return x
@@ -201,7 +229,7 @@ class TransformerNetModel2(nn.Module):
         experiment_mode='lm',
         init_pretrained=False,
         logits_mode=1,
-        use_time_cond = False,
+        use_time_cond = True, # For double conditioning on ResNet blocks as well
         context_dim = None
     ):
         super().__init__()
@@ -262,14 +290,15 @@ class TransformerNetModel2(nn.Module):
             linear(time_embed_dim, config.hidden_size), # time emb: 512, hidden size 768
         )
         ########################################################################################################
-        #                 						    START ADD                                                   #
+        #     START ADD: Double conditioning with EEG (shape depends on the EEG features)                      #
+        #                                 the Sequential later defined in conditioning.py                      #
         ########################################################################################################
-        if use_time_cond:
+        if use_time_cond: # Supposing we take inputs of 56, 840
             self.time_embed_condition = nn.Sequential(
-                nn.Conv1d(77, 77//2, 1, bias=True),
-                nn.Conv1d(77//2, 1, 1, bias=True),
+                nn.Conv1d(56, 56//2, 1, bias=True),
+                nn.Conv1d(56//2, 1, 1, bias=True),
                 nn.Linear(context_dim, time_embed_dim, bias=True) #TO MODIFY
-            )
+            ) if global_pool == False else nn.Linear(context_dim, time_embed_dim, bias=True)
         ########################################################################################################
         #                 						    END ADD                                                     #
         ########################################################################################################
@@ -386,12 +415,12 @@ class TransformerNetModel2(nn.Module):
 
         emb_x = self.input_up_proj(x)
         seq_length = x.size(1)
-        print(f"[DEBUG][TransformerNetModel2][forward] - Embedded x size: {emb_x.shape}")
+
         position_ids = self.position_ids[:, : seq_length ]
         # print(emb_x.shape, emb.shape, self.position_embeddings)
         emb_inputs = self.position_embeddings(position_ids) + emb_x + emb.unsqueeze(1).expand(-1, seq_length, -1)
         emb_inputs = self.dropout(self.LayerNorm(emb_inputs))
-        print(f"[DEBUG][TransformerNetModel2][forward] - Emb inputs size: {emb_inputs.shape}")
+
         if self.conditional_gen:
             # print(emb_inputs.shape, encoder_hidden_states.shape, encoder_attention_mask.shape)
             input_trans_hidden_states = self.input_transformers(emb_inputs,
@@ -440,3 +469,255 @@ class TransformerNetModel2(nn.Module):
             h = module(cat_in, emb)
             result["up"].append(h.type(x.dtype))
         return result
+    
+
+# Inspired from Bert Intermediate and Output
+class IntermediateLayer(nn.Module):
+
+    def __init__(self, hidden_size, intermediate_size, hidden_act=None,*args, **kwargs) -> None:
+        super().__init__()
+        self.dense = nn.Linear(hidden_size, intermediate_size)
+        if hidden_act is None:
+            self.intermediate_act_fn = GELUActivation()
+        elif isinstance(hidden_act, str):
+            self.intermediate_act_fn = ACT2FN[hidden_act]
+        else:
+            self.intermediate_act_fn = hidden_act
+
+    def forward(self, hidden_states: torch.Tensor)-> torch.Tensor:
+        hidden_states = self.dense(hidden_states )
+        hidden_states = self.intermediate_act_fn(hidden_states)
+        return hidden_states
+
+class IntermediateOutput(TimestepBlock):
+    def __init__(self, intermediate_size, hidden_size, layer_norm_eps=1e-12, hidden_dropout_prob=0.0):
+        super().__init__()
+        self.dense = nn.Linear(intermediate_size, hidden_size)
+        self.LayerNorm = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
+        self.dropout = nn.Dropout(p=hidden_dropout_prob)
+
+    def forward(self, hidden_states: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.dense(hidden_states)
+        hidden_states = self.dropout(hidden_states)
+        hidden_states = self.LayerNorm(hidden_states + emb)
+        return hidden_states
+    
+# class DiffusionBlock(nn.Module):
+
+#     def __init__(self, config) -> None:
+#         super().__init__()
+#         self.transformer_block = BasicTransformerBlock(
+#                         dim=config.hidden_size,
+#                         num_attention_heads=config.num_attention_heads,
+#                         attention_head_dim=config.hidden_size // config.num_attention_heads,
+#                         dropout=config.hidden_dropout_prob,
+#                         cross_attention_dim=config.hidden_size,
+#                         activation_fn="geglu",
+#                     )
+#         self.intermediate_layer = IntermediateLayer(hidden_size=config.hidden_size, 
+#                                         intermediate_size=config.intermediate_size)
+#         self.output_layer = IntermediateOutput(hidden_size=config.hidden_size, 
+#                                         intermediate_size=config.intermediate_size,
+#                                         layer_norm_eps=config.layer_norm_eps, 
+#                                         hidden_dropout_prob=config.hidden_dropout_prob)
+        
+#     def forward(self, hidden_states, passage_hidden, emb=None, context=None):
+#         hidden_states = self.intermediate_layer()
+
+        
+
+class CrossAttention_Diffusion_LM(nn.Module):
+    def __init__(
+            self,
+            in_channels,
+            model_channels,
+            out_channels,
+            dropout=0,
+            config=None,
+            config_name='bert-base-uncased',
+            vocab_size=None,
+            init_pretrained=True,
+            logits_mode=1,
+            token_emb_type='pretrain',
+            fix_encoder=False,
+            use_time_cond=False,
+            context_dim=1024,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.model_channels = model_channels
+        self.out_channels = out_channels
+        self.dropout = dropout
+        self.logits_mode = logits_mode
+        self.init_pretrained = init_pretrained
+        self.token_emb_type = token_emb_type
+        self.fix_encoder = fix_encoder
+        self.use_time_cond = use_time_cond
+
+        cfg = BertConfig.from_pretrained(config_name)
+        cfg.num_hidden_layers = 6
+        self.passage_encoder = BertModel.from_pretrained(config_name, config=cfg)
+
+
+        ########################################################################################################
+        #                 						    START ADD                                                   #
+        ########################################################################################################
+        if use_time_cond:
+            # Define the embedder from EEG encodings to time 
+            self.time_embed_condtion = nn.Linear(context_dim, time_embed_dim, bias=True)
+        ########################################################################################################
+        #                 						    END ADD                                                     #
+        ########################################################################################################
+
+
+        config = BertConfig.from_pretrained(config_name)
+        config.hidden_dropout_prob = self.dropout
+        print(config)
+
+        # trainable embedding layer
+        self.word_embedding = nn.Embedding(vocab_size, self.in_channels)
+        # position embedding
+        self.register_buffer("position_ids", torch.arange(config.max_position_embeddings).expand((1, -1)))
+        self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
+
+        if self.logits_mode == 2:
+            # self.lm_head = nn.Linear(self.in_channels, vocab_size, bias=False)
+            self.lm_head = nn.Linear(self.in_channels, vocab_size, bias=True)
+        else:
+            self.lm_head = nn.Linear(self.in_channels, vocab_size)
+
+        # share weight between lm_head and word_embedding
+        with torch.no_grad():
+            self.lm_head.weight = self.word_embedding.weight
+
+        # self.word_embedding = nn.Embedding(vocab_size, self.in_channels)
+        # self.lm_head = nn.Linear(self.in_channels, vocab_size)
+        # with th.no_grad():
+        #     self.lm_head.weight = self.word_embedding.weight
+
+        # time embedding layer
+        time_embed_dim = model_channels * 4
+        self.time_embed = nn.Sequential(
+            nn.Linear(model_channels, time_embed_dim),
+            nn.SiLU(),
+            nn.Linear(time_embed_dim, config.hidden_size),
+        )
+
+        # position embedding
+        self.register_buffer("position_ids", torch.arange(config.max_position_embeddings).expand((1, -1)))
+        self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
+
+        # input transform
+        self.input_up_proj = TimestepEmbedSequential(nn.Sequential(
+            nn.Linear(in_channels, config.hidden_size),
+            nn.Tanh(),
+            nn.Linear(config.hidden_size, config.hidden_size)
+        ))
+
+        # Dropout
+        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        config.num_hidden_layers = 12
+        # config.num_hidden_layers = 6
+        # # define cross attention transformer block(6 layer)
+        # self.transformer_blocks = nn.ModuleList(
+        #     [
+        #         BasicTransformerBlock(
+        #             dim=config.hidden_size,
+        #             num_attention_heads=config.num_attention_heads,
+        #             attention_head_dim=config.hidden_size // config.num_attention_heads,
+        #             dropout=config.hidden_dropout_prob,
+        #             cross_attention_dim=config.hidden_size,
+        #             activation_fn="geglu",
+        #         )
+        #         for d in range(config.num_hidden_layers)
+        #     ]
+        # )
+        ########################################################################################################
+        #                 						    START ADD                                                   #
+        ########################################################################################################
+        self.whole_blocks = nn.ModuleList([])
+        for _ in range(config.num_hidden_layers):
+            layers = [
+                BasicTransformerBlock(
+                    dim=config.hidden_size,
+                    num_attention_heads=config.num_attention_heads,
+                    attention_head_dim=config.hidden_size // config.num_attention_heads,
+                    dropout=config.hidden_dropout_prob,
+                    cross_attention_dim=config.hidden_size,
+                    activation_fn="geglu",
+                )]
+            layers.append(IntermediateLayer(hidden_size=config.hidden_size, 
+                                            intermediate_size=config.intermediate_size))
+            layers.append(IntermediateOutput(hidden_size=config.hidden_size, 
+                                             intermediate_size=config.intermediate_size,
+                                             layer_norm_eps=config.layer_norm_eps, 
+                                             hidden_dropout_prob=config.hidden_dropout_prob))
+            layers = [DiffusionBlock(config)]
+            
+            self.whole_blocks.append(TimestepEmbedSequential(*layers))
+        ########################################################################################################
+        #                 						    END ADD                                                     #
+        ########################################################################################################
+        
+
+        # output transform
+        self.output_down_proj = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size),
+            nn.Tanh(),
+            nn.Linear(config.hidden_size, out_channels)
+        )
+
+    def get_embeds(self, input_ids):
+        return self.word_embedding(input_ids)
+
+    def get_logits(self, hidden_repr):
+            raise NotImplementedError
+
+    def forward(self, x, timesteps, src_input_ids, src_attention_mask, attention_mask=None,
+                 y=None, src_ids=None, src_mask=None, context=None):
+
+        # prepare embedding
+        emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
+
+        ########################################################################################################
+        #                 			START ADD      Time Conditioning                                           #
+        ########################################################################################################
+        if self.use_time_cond:
+            c = self.time_embed_condtion(context)
+            assert c.shape[1] == 1, f'found {c.shape}'
+            emb = emb + torch.squeeze(c, dim=1)
+        ########################################################################################################
+        #                 						    END ADD                                                     #
+        ########################################################################################################
+
+        emb_x = self.input_up_proj(x)
+        seq_length = x.size(1)
+        position_ids = self.position_ids[:, : seq_length]
+        
+        emb_inputs = self.position_embeddings(position_ids) + emb_x + emb.unsqueeze(1).expand(-1, seq_length, -1)
+        hidden_states = self.dropout(self.LayerNorm(emb_inputs))
+        
+        # # encode embedding
+        # if self.fix_encoder:
+        #     with torch.no_grad():
+        #         out = self.passage_encoder(input_ids=src_input_ids,
+        #                                          attention_mask=src_attention_mask)
+        #         passage_hidden = out.last_hidden_state
+        # else:
+        #     out = self.passage_encoder(input_ids=src_input_ids,
+        #                                attention_mask=src_attention_mask,  emb=emb, context=context)
+        #     passage_hidden = out.last_hidden_state + 0 * out.pooler_output.unsqueeze(1)
+
+        # # Transfromer blocks
+        # for block in self.transformer_blocks:
+        #     hidden_states = block(hidden_states, passage_hidden, emb=emb, context=context)
+        passage_hidden = [src_ids]
+        for (i, module) in enumerate(self.whole_blocks):
+            hidden_states = module(hidden_states, passage_hidden[-1], emb=emb, context=context)
+            passage_hidden.append(hidden_states)
+
+        # Output
+        h = self.output_down_proj(hidden_states,  emb=emb, context=context)
+        h = h.type(x.dtype)
+        return h

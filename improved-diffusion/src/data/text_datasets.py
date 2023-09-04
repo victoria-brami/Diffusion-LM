@@ -19,6 +19,7 @@ import torch
 from collections import Counter, defaultdict
 from functools import partial
 from itertools import chain
+import torch
 
 
 def load_data_text(
@@ -965,12 +966,11 @@ def _collate_batch_helper(examples, pad_token_id, max_length, return_mask=False)
 
 def _torch_collate_batch(examples, pad_token_id, max_length):
     """Collate `examples` into a batch, using the information in `tokenizer` for padding if necessary."""
-    import numpy as np
-    import torch
+
 
     # Tensorize if necessary.
     if isinstance(examples[0], (list, tuple, np.ndarray)):
-        examples = [torch.tensor(e, dtype=torch.long) for e in examples]
+        examples = [torch.Tensor(e, dtype=torch.long) for e in examples]
 
     # length_of_first = examples[0].size(0)
     # Check if padding is necessary.

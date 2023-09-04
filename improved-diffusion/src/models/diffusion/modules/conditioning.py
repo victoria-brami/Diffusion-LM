@@ -6,5 +6,9 @@ import torch.nn as nn
 
 
 class EEGTimeEmbedding(nn.Module):
-    def __init__():
+
+    def __init__(self):
+        pass
+
+    def forward(self):
         pass
